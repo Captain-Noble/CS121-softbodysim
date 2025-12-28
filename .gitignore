@@ -1,0 +1,114 @@
+###############################################################################
+# Unity – 基础
+###############################################################################
+
+# ◆ 每次编译生成的库、临时文件、缓存
+[Ll]ibrary/
+[Ll]ibraries/
+[Tt]emp/
+[Bb]uild/
+[Bb]uilds/
+[Oo]bj/
+[Ll]ogs/
+[Mm]emoryCaptures/
+
+# ◆ Unity 2020+ 的可重建缓存
+#（若使用 Accelerator 或 Cache Server，可全部忽略）
+.glTFCache/
+Assets/AssetStoreTools*       # PackageManager 下载的 AssetStore 内容
+Assets/Plugins/Editor/JetBrains* # Rider 插件缓存
+
+# ◆ 本地用户设置（不共享）
+UserSettings/
+.vs/                         # VS/VSCode/Rider 生成
+.vs/*
+*.csproj
+*.unityproj
+*.sln
+*.suo
+*.tmp
+*.user
+*.userprefs
+*.pidb
+*.booproj
+*.svd
+
+# VSCode
+.vscode/
+
+###############################################################################
+# 平台-相关生成物
+###############################################################################
+
+# macOS
+.DS_Store
+*.plist
+
+# Windows
+[Ll]ibrary/PackageCache/  # UPM 缓存（可选）
+Thumbs.db
+Desktop.ini
+
+# Linux
+*~
+
+###############################################################################
+# 构建产物（根据实际平台增删）
+###############################################################################
+
+# Android
+*.apk
+*.aab
+*.gradle
+*.keystore
+
+# iOS / Xcode
+*.xcworkspace
+*.xcuserstate
+*.xcuserdata/
+*.mode1v3
+*.mode2v3
+*.moved-aside
+*.pbxuser
+*.swiftmodule
+*.swiftsourceinfo
+
+# WebGL
+Builds/WebGL/**
+
+###############################################################################
+# 版本控制系统自身
+###############################################################################
+# Git 目录
+.git/
+
+# LFS 锁文件
+*.lfsconfig
+
+###############################################################################
+# 其他常见工具 / 插件
+###############################################################################
+
+# Rider / JetBrains
+.idea/
+*.sln.DotSettings*
+
+# Visual Studio Code – 包含本地化设置、历史等
+.vscode/
+.history/
+
+# Collaborate 背景文件（若使用 Unity Plastic SCM 则忽略）
+.collab/
+
+# Crashlytics / Firebase
+crashlytics-build.properties
+fabric.properties
+
+###############################################################################
+# 背景说明
+# -----------------------------------------------------------------------------
+# • Library、Temp、Obj 等目录均可由 Unity 自动生成，存入 Git 只会徒增体积。
+# • UserSettings 与 IDE 工程文件只对本机有效，不宜提交。
+# • Build 产物建议在持续集成或本机生成，不纳入版本库。
+# • 若团队依赖特定本地文件（如 .keystore），请改用私有包或加密存储。
+###############################################################################
