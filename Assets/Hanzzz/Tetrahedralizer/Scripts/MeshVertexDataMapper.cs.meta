@@ -1,0 +1,18 @@
+fileFormatVersion: 2
+guid: efe6bbfff5fb6430482e6a81a05a69d2
+MonoImporter:
+  externalObjects: {}
+  serializedVersion: 2
+  defaultReferences: []
+  executionOrder: 0
+  icon: {instanceID: 0}
+  userData: 
+  assetBundleName: 
+  assetBundleVariant: 
+AssetOrigin:
+  serializedVersion: 1
+  productId: 306196
+  packageName: Tetrahedralizer
+  packageVersion: 1.0.0
+  assetPath: Assets/Hanzzz/Tetrahedralizer/Scripts/MeshVertexDataMapper.cs
+  uploadId: 733342

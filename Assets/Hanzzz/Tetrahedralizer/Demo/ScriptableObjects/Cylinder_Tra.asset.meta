@@ -1,0 +1,15 @@
+fileFormatVersion: 2
+guid: a2425464fdecc4002919e23d3ec4617b
+NativeFormatImporter:
+  externalObjects: {}
+  mainObjectFileID: 11400000
+  userData: 
+  assetBundleName: 
+  assetBundleVariant: 
+AssetOrigin:
+  serializedVersion: 1
+  productId: 306196
+  packageName: Tetrahedralizer
+  packageVersion: 1.0.0
+  assetPath: Assets/Hanzzz/Tetrahedralizer/Demo/ScriptableObjects/Cylinder_Tra.asset
+  uploadId: 733342

@@ -1,0 +1,15 @@
+fileFormatVersion: 2
+guid: 0a00986e20d5c4200bfa18a3bca034fc
+NativeFormatImporter:
+  externalObjects: {}
+  mainObjectFileID: 11400000
+  userData: 
+  assetBundleName: 
+  assetBundleVariant: 
+AssetOrigin:
+  serializedVersion: 1
+  productId: 306196
+  packageName: Tetrahedralizer
+  packageVersion: 1.0.0
+  assetPath: Assets/Hanzzz/Tetrahedralizer/Demo/ScriptableObjects/Cylinder_Ted.asset
+  uploadId: 733342

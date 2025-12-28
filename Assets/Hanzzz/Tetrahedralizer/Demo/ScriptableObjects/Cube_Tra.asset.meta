@@ -1,0 +1,15 @@
+fileFormatVersion: 2
+guid: 2371364253c8b4400ac9421e1e467a8f
+NativeFormatImporter:
+  externalObjects: {}
+  mainObjectFileID: 11400000
+  userData: 
+  assetBundleName: 
+  assetBundleVariant: 
+AssetOrigin:
+  serializedVersion: 1
+  productId: 306196
+  packageName: Tetrahedralizer
+  packageVersion: 1.0.0
+  assetPath: Assets/Hanzzz/Tetrahedralizer/Demo/ScriptableObjects/Cube_Tra.asset
+  uploadId: 733342

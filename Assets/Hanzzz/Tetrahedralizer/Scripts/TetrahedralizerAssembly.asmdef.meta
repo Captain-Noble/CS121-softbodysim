@@ -1,0 +1,14 @@
+fileFormatVersion: 2
+guid: 8cd24bfd6871741a2af3c6a8b4d12a2e
+AssemblyDefinitionImporter:
+  externalObjects: {}
+  userData: 
+  assetBundleName: 
+  assetBundleVariant: 
+AssetOrigin:
+  serializedVersion: 1
+  productId: 306196
+  packageName: Tetrahedralizer
+  packageVersion: 1.0.0
+  assetPath: Assets/Hanzzz/Tetrahedralizer/Scripts/TetrahedralizerAssembly.asmdef
+  uploadId: 733342

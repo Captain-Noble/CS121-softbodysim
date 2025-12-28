@@ -1,0 +1,15 @@
+fileFormatVersion: 2
+guid: d1dab0102b37d4cbb9cba48dfab7adf4
+NativeFormatImporter:
+  externalObjects: {}
+  mainObjectFileID: 11400000
+  userData: 
+  assetBundleName: 
+  assetBundleVariant: 
+AssetOrigin:
+  serializedVersion: 1
+  productId: 306196
+  packageName: Tetrahedralizer
+  packageVersion: 1.0.0
+  assetPath: Assets/Hanzzz/Tetrahedralizer/Demo/ScriptableObjects/Cube_Ted.asset
+  uploadId: 733342

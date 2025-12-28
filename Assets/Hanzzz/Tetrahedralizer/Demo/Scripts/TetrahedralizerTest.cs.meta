@@ -1,0 +1,18 @@
+fileFormatVersion: 2
+guid: 89eeaadf1471b497a9355d0c8a9dbfa4
+MonoImporter:
+  externalObjects: {}
+  serializedVersion: 2
+  defaultReferences: []
+  executionOrder: 0
+  icon: {instanceID: 0}
+  userData: 
+  assetBundleName: 
+  assetBundleVariant: 
+AssetOrigin:
+  serializedVersion: 1
+  productId: 306196
+  packageName: Tetrahedralizer
+  packageVersion: 1.0.0
+  assetPath: Assets/Hanzzz/Tetrahedralizer/Demo/Scripts/TetrahedralizerTest.cs
+  uploadId: 733342

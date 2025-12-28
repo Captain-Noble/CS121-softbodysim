@@ -1,0 +1,18 @@
+fileFormatVersion: 2
+guid: 6e9e7b76f35df4e88975ac3369eb5246
+MonoImporter:
+  externalObjects: {}
+  serializedVersion: 2
+  defaultReferences: []
+  executionOrder: 0
+  icon: {instanceID: 0}
+  userData: 
+  assetBundleName: 
+  assetBundleVariant: 
+AssetOrigin:
+  serializedVersion: 1
+  productId: 306196
+  packageName: Tetrahedralizer
+  packageVersion: 1.0.0
+  assetPath: Assets/Hanzzz/Tetrahedralizer/Scripts/Editor/TetrahedralMeshEditor.cs
+  uploadId: 733342
