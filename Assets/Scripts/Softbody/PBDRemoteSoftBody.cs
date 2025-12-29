@@ -1,50 +1,55 @@
-// PBDSoftBody.cs
+// PBDRemoteSoftBody.cs
 using System;
 using System.Collections.Generic;
 using UnityEngine;
 
 [DisallowMultipleComponent]
 [RequireComponent(typeof(MeshFilter), typeof(MeshRenderer))]
-public sealed class PBDSoftBody : MonoBehaviour
+public sealed class PBDRemoteSoftBody : MonoBehaviour
 {
     [Header("Auto Tetrahedralize")]
     public bool autoTetrahedralize = true;
 
-    [Tooltip("Remove too-small tets. 0 keeps all. See Tetrahedralizer docs.")]
     [Range(0.0f, 1.0f)]
     public double degenerateTetrahedronRatio = 0.0;
 
-    [Header("Mass / Pinning")]
+    [Header("Pinning")]
     public bool pinTopLayer = false;
     public float pinTopEpsilon = 1e-4f;
-
-    [Header("XPBD Compliance (0 = rigid)")]
-    public float edgeCompliance = 0.0005f;
-    public float volumeCompliance = 0.0f;
 
     [Header("Rendering")]
     public bool updateNormals = false;
     public int normalsEveryNFrames = 0;
 
-    internal RuntimeTetMesh runtimeMesh;
-
-    internal int globalParticleStart;
-    internal int globalParticleCount;
-    internal int globalEdgeStart;
-    internal int globalEdgeCount;
-    internal int globalTetStart;
-    internal int globalTetCount;
+    private Vector3[] _verticesLocal;
+    private int[] _tetIds;
+    private int[] _edgeIds;
+    private int[] _surfaceTriIds;
 
     private Mesh _mesh;
     private Vector3[] _meshVerts;
-    private int[] _surfaceTris;
+    private int[] _meshTris;
     private int _frameCounter;
+
+    private float[] _initWorldPos;
+    private int[] _pinnedIndices;
+
+    public int VertexCount => _verticesLocal != null ? _verticesLocal.Length : 0;
+    public int EdgeCount => _edgeIds != null ? _edgeIds.Length / 2 : 0;
+    public int TetCount => _tetIds != null ? _tetIds.Length / 4 : 0;
+
+    public Vector3[] VerticesLocal => _verticesLocal;
+    public int[] EdgeIds => _edgeIds;
+    public int[] TetIds => _tetIds;
+
+    public float[] InitWorldPositionsBuffer => _initWorldPos;
+    public int[] PinnedIndicesBuffer => _pinnedIndices;
 
     private void OnEnable()
     {
         if (autoTetrahedralize)
         {
-            if (!TryBuildRuntimeTetMesh(out string err))
+            if (!TryBuildFromMeshFilter(out var err))
             {
                 Debug.LogError($"[{name}] Auto tetrahedralize failed: {err}", this);
                 enabled = false;
@@ -52,32 +57,28 @@ public sealed class PBDSoftBody : MonoBehaviour
             }
         }
 
-        if (runtimeMesh == null || !runtimeMesh.IsValid)
+        if (_verticesLocal == null || _tetIds == null || _edgeIds == null || _surfaceTriIds == null)
         {
-            Debug.LogError($"[{name}] runtimeMesh is missing/invalid. Enable autoTetrahedralize or set runtimeMesh in code.", this);
+            Debug.LogError($"[{name}] Missing tetra data.", this);
             enabled = false;
             return;
         }
 
-        BuildRenderMeshFromTetSurface();
+        BuildRenderMesh();
+        CachePinnedIndicesMainThread();
+        CaptureInitWorldPositionsMainThread();
 
-        var world = FindAnyObjectByType<PBDWorld>();
+        var world = FindAnyObjectByType<PBDRemoteWorld>();
         if (world == null)
         {
-            Debug.LogError("No PBDWorld found in scene.");
+            Debug.LogError("No PBDRemoteWorld found.");
             enabled = false;
             return;
         }
-        world.RegisterBody(this);
+        world.BindBody(this);
     }
 
-    private void OnDisable()
-    {
-        var world = FindAnyObjectByType<PBDWorld>();
-        if (world != null) world.UnregisterBody(this);
-    }
-
-    private bool TryBuildRuntimeTetMesh(out string error)
+    private bool TryBuildFromMeshFilter(out string error)
     {
         error = null;
 
@@ -89,36 +90,44 @@ public sealed class PBDSoftBody : MonoBehaviour
             return false;
         }
 
-        if (!TetrahedralizerBridge.IsAvailable())
+        if (!TetrahedralizerRuntimeBridge.IsAvailable())
         {
-            error = "Tetrahedralizer plugin not detected. (Type 'Tetrahedralizer' not found).";
+            error = "Tetrahedralizer plugin not detected (types not found at runtime).";
             return false;
         }
 
-        var tet = TetrahedralizerBridge.GenerateTetMeshFromUnityMesh(src, degenerateTetrahedronRatio, out error);
-        if (tet == null) return false;
+        if (!TetrahedralizerRuntimeBridge.TryTetrahedralizeMesh(
+                src,
+                remapVertexData: false,
+                degenerateTetrahedronRatio: degenerateTetrahedronRatio,
+                out var tet,
+                out error))
+        {
+            return false;
+        }
 
-        BuildEdgesAndSurface(tet.vertices, tet.tetIds, out tet.edgeIds, out tet.surfaceTriIds);
+        _verticesLocal = tet.vertices;
+        _tetIds = tet.tetrahedrons;
 
-        runtimeMesh = tet;
+        BuildEdgesAndSurface(_verticesLocal, _tetIds, out _edgeIds, out _surfaceTriIds);
         return true;
     }
 
-    private void BuildRenderMeshFromTetSurface()
+    private void BuildRenderMesh()
     {
         _mesh = new Mesh();
-        _mesh.name = $"{name}_PBDTetSurface";
-        _mesh.indexFormat = runtimeMesh.vertices.Length > 65535
+        _mesh.name = $"{name}_RemoteTetSurface";
+        _mesh.indexFormat = _verticesLocal.Length > 65535
             ? UnityEngine.Rendering.IndexFormat.UInt32
             : UnityEngine.Rendering.IndexFormat.UInt16;
 
-        _meshVerts = new Vector3[runtimeMesh.vertices.Length];
-        Array.Copy(runtimeMesh.vertices, _meshVerts, _meshVerts.Length);
+        _meshVerts = new Vector3[_verticesLocal.Length];
+        Array.Copy(_verticesLocal, _meshVerts, _meshVerts.Length);
 
-        _surfaceTris = runtimeMesh.surfaceTriIds;
+        _meshTris = _surfaceTriIds;
 
         _mesh.vertices = _meshVerts;
-        _mesh.triangles = _surfaceTris;
+        _mesh.triangles = _meshTris;
 
         _mesh.RecalculateBounds();
         if (updateNormals) _mesh.RecalculateNormals();
@@ -127,17 +136,65 @@ public sealed class PBDSoftBody : MonoBehaviour
         GetComponent<MeshFilter>().sharedMesh = _mesh;
     }
 
-    internal void UploadFromWorld(Vector3[] worldPositions)
+    private void CaptureInitWorldPositionsMainThread()
+    {
+        int n = VertexCount;
+        if (n <= 0)
+        {
+            _initWorldPos = Array.Empty<float>();
+            return;
+        }
+
+        int need = n * 3;
+        if (_initWorldPos == null || _initWorldPos.Length != need)
+            _initWorldPos = new float[need];
+
+        var l2w = transform.localToWorldMatrix;
+        for (int i = 0; i < n; i++)
+        {
+            Vector3 p = l2w.MultiplyPoint3x4(_verticesLocal[i]);
+            int k = i * 3;
+            _initWorldPos[k + 0] = p.x;
+            _initWorldPos[k + 1] = p.y;
+            _initWorldPos[k + 2] = p.z;
+        }
+    }
+
+    private void CachePinnedIndicesMainThread()
+    {
+        if (!pinTopLayer || _verticesLocal == null || _verticesLocal.Length == 0)
+        {
+            _pinnedIndices = Array.Empty<int>();
+            return;
+        }
+
+        float topY = float.NegativeInfinity;
+        for (int i = 0; i < _verticesLocal.Length; i++)
+            if (_verticesLocal[i].y > topY) topY = _verticesLocal[i].y;
+
+        var list = new List<int>(128);
+        for (int i = 0; i < _verticesLocal.Length; i++)
+        {
+            if (Mathf.Abs(_verticesLocal[i].y - topY) <= pinTopEpsilon)
+                list.Add(i);
+        }
+
+        _pinnedIndices = list.Count == 0 ? Array.Empty<int>() : list.ToArray();
+    }
+
+    public void ApplyWorldPositions(float[] worldPos)
     {
         if (_mesh == null || _meshVerts == null) return;
 
-        var w2l = transform.worldToLocalMatrix;
-        int start = globalParticleStart;
-        int count = globalParticleCount;
+        int n = VertexCount;
+        if (worldPos == null || worldPos.Length < n * 3) return;
 
-        for (int i = 0; i < count; i++)
+        var w2l = transform.worldToLocalMatrix;
+        for (int i = 0; i < n; i++)
         {
-            _meshVerts[i] = w2l.MultiplyPoint3x4(worldPositions[start + i]);
+            int k = i * 3;
+            Vector3 p = new Vector3(worldPos[k + 0], worldPos[k + 1], worldPos[k + 2]);
+            _meshVerts[i] = w2l.MultiplyPoint3x4(p);
         }
 
         _mesh.vertices = _meshVerts;
@@ -154,36 +211,9 @@ public sealed class PBDSoftBody : MonoBehaviour
         }
     }
 
-    internal void GetInitialWorldPositions(Vector3[] dst, int dstStart)
+    private readonly struct EdgeKey : IEquatable<EdgeKey>
     {
-        var l2w = transform.localToWorldMatrix;
-        var verts = runtimeMesh.vertices;
-        for (int i = 0; i < verts.Length; i++)
-        {
-            dst[dstStart + i] = l2w.MultiplyPoint3x4(verts[i]);
-        }
-    }
-
-    internal void ApplyPinning(float[] invMassGlobal, int start)
-    {
-        if (!pinTopLayer) return;
-
-        float topY = float.NegativeInfinity;
-        var verts = runtimeMesh.vertices;
-        for (int i = 0; i < verts.Length; i++)
-            if (verts[i].y > topY) topY = verts[i].y;
-
-        for (int i = 0; i < verts.Length; i++)
-        {
-            if (Mathf.Abs(verts[i].y - topY) <= pinTopEpsilon)
-                invMassGlobal[start + i] = 0f;
-        }
-    }
-
-    private struct EdgeKey : IEquatable<EdgeKey>
-    {
-        public readonly int a;
-        public readonly int b;
+        public readonly int a, b;
         public EdgeKey(int i0, int i1)
         {
             if (i0 < i1) { a = i0; b = i1; }
@@ -193,7 +223,7 @@ public sealed class PBDSoftBody : MonoBehaviour
         public override int GetHashCode() => (a * 73856093) ^ (b * 19349663);
     }
 
-    private struct FaceKey : IEquatable<FaceKey>
+    private readonly struct FaceKey : IEquatable<FaceKey>
     {
         public readonly int a, b, c;
         public FaceKey(int i0, int i1, int i2)
@@ -208,9 +238,9 @@ public sealed class PBDSoftBody : MonoBehaviour
         public override int GetHashCode() => (a * 73856093) ^ (b * 19349663) ^ (c * 83492791);
     }
 
-    private struct FaceOri
+    private readonly struct FaceOri
     {
-        public int i0, i1, i2;
+        public readonly int i0, i1, i2;
         public FaceOri(int a, int b, int c) { i0 = a; i1 = b; i2 = c; }
     }
 
