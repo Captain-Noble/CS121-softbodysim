@@ -1,12 +1,11 @@
-// SoftBodyManager.cs
-// ÇëÒÔ UTF-8 ±£´æ±¾ÎÄ¼þ
+ï»¿// SoftBodyManager.cs
+// è¯·ä»¥ UTF-8 ä¿å­˜æœ¬æ–‡ä»¶
 using System.Collections.Generic;
 using System.Diagnostics;
 using UnityEngine;
 
 public sealed class SoftBodyManager : MonoBehaviour
 {
-    #region Types
     public enum ComputeMode
     {
         SingleThread = 0,
@@ -15,61 +14,51 @@ public sealed class SoftBodyManager : MonoBehaviour
 
     private struct FrameTimers
     {
-        public double TotalMs;
-        public double CacheMs;
-        public double PreMs;
-        public double SolveMs;
-        public double CollidersMs;
-        public double PostMs;
-        public double UploadMs;
-        public double NormalsMs;
-
-        public void Clear()
-        {
-            TotalMs = 0.0;
-            CacheMs = 0.0;
-            PreMs = 0.0;
-            SolveMs = 0.0;
-            CollidersMs = 0.0;
-            PostMs = 0.0;
-            UploadMs = 0.0;
-            NormalsMs = 0.0;
-        }
+        public double TotalMs, CacheMs, PreMs, SolveMs, CollidersMs, PostMs, UploadMs, NormalsMs;
+        public void Clear() => TotalMs = CacheMs = PreMs = SolveMs = CollidersMs = PostMs = UploadMs = NormalsMs = 0.0;
     }
-    #endregion
 
-    #region Singleton
     public static SoftBodyManager Instance { get; private set; }
-    #endregion
 
-    #region Inspector
+    [Header("Simulation")]
     [SerializeField] private Vector3 gravity = new Vector3(0f, -10f, 0f);
-    [SerializeField] private int substeps = 10;
-    [SerializeField] private int solverIterations = 1;
-    [SerializeField] private bool simulateInFixedUpdate = true;
+    [SerializeField, Min(1)] private int substeps = 8;
+    [SerializeField, Min(1)] private int solverIterations = 6;
+
+    [SerializeField] private bool simulateInFixedUpdate = false;
     [SerializeField] private float fixedDtOverride = 1f / 60f;
 
+    [Header("Update Fixed-Timestep (recommended)")]
+    [SerializeField, Min(1)] private int maxStepsPerFrame = 4;
+    [SerializeField, Min(0.001f)] private float maxFrameDeltaTime = 0.05f;
+
+    [Header("Threading")]
     [SerializeField] private ComputeMode computeMode = ComputeMode.SingleThread;
     [SerializeField] private int maxWorkerThreads = 0;
 
+    [Header("Auto Registration")]
+    [SerializeField] private bool autoRegisterAllSolversOnEnable = true;
+    [SerializeField] private bool autoRegisterAllPrimitiveCollidersOnEnable = true;
+
+    [Header("Stats")]
     [SerializeField] private bool printStats = true;
     [SerializeField] private float statsPeriodSeconds = 1f;
-    [SerializeField] private bool autoRegisterAllSolversOnEnable = true;
-    #endregion
 
-    #region State
     private readonly List<SoftBodySolver> solvers = new List<SoftBodySolver>(64);
+    private readonly List<SoftBodyPrimitiveCollider> primitiveColliders = new List<SoftBodyPrimitiveCollider>(64);
 
-    private readonly Stopwatch swTotal = new Stopwatch();
+    private SoftBodyPrimitiveCollider.PrimitiveColliderData[] colliderCache = new SoftBodyPrimitiveCollider.PrimitiveColliderData[0];
+    private int colliderCacheCount = 0;
+
     private readonly Stopwatch swSeg = new Stopwatch();
+    private readonly Stopwatch swTotal = new Stopwatch();
 
     private float fpsTimer;
     private int fpsFrames;
-
     private FrameTimers period;
-    #endregion
 
-    #region Unity
+    private float accumulator;
+
     private void Awake()
     {
         if (Instance != null && Instance != this) { Destroy(gameObject); return; }
@@ -79,6 +68,7 @@ public sealed class SoftBodyManager : MonoBehaviour
     private void OnEnable()
     {
         if (autoRegisterAllSolversOnEnable) RegisterAllSolversInScene();
+        if (autoRegisterAllPrimitiveCollidersOnEnable) RegisterAllPrimitiveCollidersInScene();
     }
 
     private void OnDestroy()
@@ -86,21 +76,63 @@ public sealed class SoftBodyManager : MonoBehaviour
         if (Instance == this) Instance = null;
     }
 
+    private float GetFixedStepDt()
+    {
+        return fixedDtOverride > 0f ? fixedDtOverride : Time.fixedDeltaTime;
+    }
+
     private void Update()
     {
-        if (!simulateInFixedUpdate) StepAll(Time.deltaTime);
+        if (!simulateInFixedUpdate)
+        {
+            float frameDt = Time.deltaTime;
+            if (frameDt > maxFrameDeltaTime) frameDt = maxFrameDeltaTime;
+            accumulator += frameDt;
+
+            float stepDt = GetFixedStepDt();
+
+            int steps = 0;
+            while (accumulator >= stepDt && steps < maxStepsPerFrame)
+            {
+                StepSimulation(stepDt);
+                accumulator -= stepDt;
+                steps++;
+            }
+
+            if (steps >= maxStepsPerFrame)
+                accumulator = 0f;
+        }
+
         TickStats();
     }
 
     private void FixedUpdate()
     {
         if (!simulateInFixedUpdate) return;
-        float dt = fixedDtOverride > 0f ? fixedDtOverride : Time.fixedDeltaTime;
-        StepAll(dt);
+        StepSimulation(GetFixedStepDt());
     }
-    #endregion
 
-    #region API
+    private void LateUpdate()
+    {
+        if (solvers.Count == 0) return;
+
+        swTotal.Restart();
+
+        swSeg.Restart();
+        for (int i = 0; i < solvers.Count; i++) solvers[i].UploadMeshVerticesBoundsMainThread();
+        swSeg.Stop();
+        period.UploadMs += swSeg.Elapsed.TotalMilliseconds;
+
+        swSeg.Restart();
+        for (int i = 0; i < solvers.Count; i++) solvers[i].UploadMeshNormalsMainThread();
+        swSeg.Stop();
+        period.NormalsMs += swSeg.Elapsed.TotalMilliseconds;
+
+        swTotal.Stop();
+        period.TotalMs += swTotal.Elapsed.TotalMilliseconds;
+    }
+
+    // ---------- Public API ----------
     public void Register(SoftBodySolver solver)
     {
         if (solver == null) return;
@@ -115,16 +147,29 @@ public sealed class SoftBodyManager : MonoBehaviour
 
     public void RegisterAllSolversInScene()
     {
-        var all = FindObjectsByType<SoftBodySolver>(FindObjectsSortMode.None);
+        var all = FindObjectsOfType<SoftBodySolver>(true);
         for (int i = 0; i < all.Length; i++) Register(all[i]);
     }
 
-    public Vector3 Gravity => gravity;
-    public int Substeps => Mathf.Max(1, substeps);
-    public int SolverIterations => Mathf.Max(1, solverIterations);
-    #endregion
+    public void RegisterPrimitiveCollider(SoftBodyPrimitiveCollider c)
+    {
+        if (c == null) return;
+        if (!primitiveColliders.Contains(c)) primitiveColliders.Add(c);
+    }
 
-    #region Stats
+    public void UnregisterPrimitiveCollider(SoftBodyPrimitiveCollider c)
+    {
+        if (c == null) return;
+        primitiveColliders.Remove(c);
+    }
+
+    public void RegisterAllPrimitiveCollidersInScene()
+    {
+        var all = FindObjectsOfType<SoftBodyPrimitiveCollider>(true);
+        for (int i = 0; i < all.Length; i++) RegisterPrimitiveCollider(all[i]);
+    }
+
+    // ---------- Stats ----------
     private void TickStats()
     {
         if (!printStats) return;
@@ -165,62 +210,70 @@ public sealed class SoftBodyManager : MonoBehaviour
         fpsTimer = 0f;
         period.Clear();
     }
-    #endregion
 
-    #region Simulation
-    private void StepAll(float dt)
+    // ---------- Simulation ----------
+    private void StepSimulation(float dt)
     {
         if (solvers.Count == 0) return;
 
-        bool mt = computeMode == ComputeMode.MultiThreadWithinSolver;
+        bool useParallel = computeMode == ComputeMode.MultiThreadWithinSolver;
         int threads = maxWorkerThreads > 0 ? maxWorkerThreads : System.Environment.ProcessorCount;
 
         swTotal.Restart();
 
-        int ss = Substeps;
+        int ss = Mathf.Max(1, substeps);
         float sdt = dt / ss;
+
+        swSeg.Restart();
+        RebuildColliderCache();
+        for (int i = 0; i < solvers.Count; i++)
+            solvers[i].CacheStepDataMainThread(gravity, useParallel, threads, colliderCache, colliderCacheCount, solverIterations);
+        swSeg.Stop();
+        period.CacheMs += swSeg.Elapsed.TotalMilliseconds;
 
         for (int step = 0; step < ss; step++)
         {
-            swSeg.Restart();
-            for (int i = 0; i < solvers.Count; i++) solvers[i].CacheStepDataMainThread(gravity, mt, threads);
-            swSeg.Stop();
-            period.CacheMs += swSeg.Elapsed.TotalMilliseconds;
-
             swSeg.Restart();
             for (int i = 0; i < solvers.Count; i++) solvers[i].PreSolveWorkerSafe(sdt);
             swSeg.Stop();
             period.PreMs += swSeg.Elapsed.TotalMilliseconds;
 
             swSeg.Restart();
-            for (int it = 0; it < SolverIterations; it++)
-                for (int i = 0; i < solvers.Count; i++) solvers[i].SolveWorkerSafe(sdt);
+            for (int i = 0; i < solvers.Count; i++) solvers[i].SolveWorkerSafe(sdt);
             swSeg.Stop();
             period.SolveMs += swSeg.Elapsed.TotalMilliseconds;
-
-            swSeg.Restart();
-            for (int i = 0; i < solvers.Count; i++) solvers[i].SolveCollidersMainThread();
-            swSeg.Stop();
-            period.CollidersMs += swSeg.Elapsed.TotalMilliseconds;
 
             swSeg.Restart();
             for (int i = 0; i < solvers.Count; i++) solvers[i].PostSolveWorkerSafe(sdt);
             swSeg.Stop();
             period.PostMs += swSeg.Elapsed.TotalMilliseconds;
-
-            swSeg.Restart();
-            for (int i = 0; i < solvers.Count; i++) solvers[i].UploadMeshVerticesBoundsMainThread();
-            swSeg.Stop();
-            period.UploadMs += swSeg.Elapsed.TotalMilliseconds;
-
-            swSeg.Restart();
-            for (int i = 0; i < solvers.Count; i++) solvers[i].UploadMeshNormalsMainThread();
-            swSeg.Stop();
-            period.NormalsMs += swSeg.Elapsed.TotalMilliseconds;
         }
 
         swTotal.Stop();
         period.TotalMs += swTotal.Elapsed.TotalMilliseconds;
     }
-    #endregion
+
+    private void RebuildColliderCache()
+    {
+        int count = 0;
+        for (int i = 0; i < primitiveColliders.Count; i++)
+        {
+            var c = primitiveColliders[i];
+            if (c == null) continue;
+            if (!c.IsActiveForSoftBody) continue;
+            count++;
+        }
+
+        if (colliderCache == null || colliderCache.Length < count)
+            colliderCache = new SoftBodyPrimitiveCollider.PrimitiveColliderData[Mathf.NextPowerOfTwo(Mathf.Max(1, count))];
+
+        colliderCacheCount = 0;
+        for (int i = 0; i < primitiveColliders.Count; i++)
+        {
+            var c = primitiveColliders[i];
+            if (c == null) continue;
+            if (!c.IsActiveForSoftBody) continue;
+            colliderCache[colliderCacheCount++] = c.GetWorldData();
+        }
+    }
 }

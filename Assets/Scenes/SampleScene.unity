@@ -1032,12 +1032,13 @@ MonoBehaviour:
   m_Name: 
   m_EditorClassIdentifier: 
   gravity: {x: 0, y: -10, z: 0}
-  substeps: 10
-  solverIterations: 1
-  simulateInFixedUpdate: 1
-  fixedDtOverride: 0.01
+  substeps: 6
+  solverIterations: 2
+  simulateInFixedUpdate: 0
+  fixedDtOverride: 0.001
   computeMode: 1
   maxWorkerThreads: 36
+  parallelChunkSize: 0
   printStats: 1
   statsPeriodSeconds: 1
   autoRegisterAllSolversOnEnable: 1
@@ -1094,9 +1095,8 @@ MonoBehaviour:
   meshAsset: {fileID: 0}
   remapVertexData: 0
   degenerateTetrahedronRatio: 0
-  edgeCompliance: 100
-  volumeCompliance: 1
-  sorOmega: 1.5
+  edgeCompliance: 10
+  volumeCompliance: 0
   pinTopLayer: 0
   pinTopEpsilon: 0.0001
   groundCollision: 1
@@ -1169,8 +1169,8 @@ Transform:
   m_GameObject: {fileID: 1686351875}
   serializedVersion: 2
   m_LocalRotation: {x: 0, y: 0, z: 0, w: 1}
-  m_LocalPosition: {x: 0.22, y: 5.38, z: -0.23}
-  m_LocalScale: {x: 3, y: 3, z: 3}
+  m_LocalPosition: {x: 0.21, y: 5.41, z: -0.23}
+  m_LocalScale: {x: 1, y: 1, z: 1}
   m_ConstrainProportionsScale: 1
   m_Children: []
   m_Father: {fileID: 0}
