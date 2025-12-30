@@ -2,6 +2,7 @@
 // 请以 UTF-8 保存本文件
 using Hanzzz.Tetrahedralizer;
 using System;
+using System.Runtime.InteropServices;
 using System.Threading.Tasks;
 using UnityEngine;
 
@@ -19,6 +20,16 @@ public sealed class SoftBodySolver : MonoBehaviour
     [SerializeField] private bool autoRegisterToManager = true;
     [SerializeField] private ThreadingMode threading = ThreadingMode.InheritManager;
 
+    [Header("Inter-SoftBody Collision")]
+    [SerializeField] private bool interSoftBodyCollision = true;
+
+    [Header("GPU Backend")]
+    [SerializeField] private bool allowGpu = true;
+    [SerializeField] private ComputeShader softBodyCompute;
+    [Tooltip("GPU 渲染：shader 需要支持 StructuredBuffer _Positions/_Normals（用我给你的 SoftBodyGpuRenderLit.shader）")]
+    [SerializeField] private bool enableGpuRendering = true;
+    [SerializeField] private Material gpuRenderMaterialOverride;
+
     [Header("Mesh / Asset")]
     [SerializeField] private bool autoGenerateAssetFromMesh = true;
     [SerializeField] private MeshFilter sourceMeshFilter;
@@ -26,16 +37,13 @@ public sealed class SoftBodySolver : MonoBehaviour
     [SerializeField][Range(0f, 1f)] private float degenerateTetrahedronRatio = 0f;
 
     [Header("Constraints (stiffness, NOT compliance)")]
-    [Tooltip("0=完全不约束, 1=尽量刚性(需要足够 iterations/substeps)")]
     [SerializeField][Range(0f, 1f)] private float edgeStiffness = 0.9f;
-    [Tooltip("体积保持强烈建议 >= 0.95")]
     [SerializeField][Range(0f, 1f)] private float volumeStiffness = 0.98f;
 
     [Header("Parallel Jacobi (constraint averaging + SOR)")]
     [SerializeField][Range(0.5f, 2.0f)] private float sorOmega = 1.4f;
 
     [Header("Mass")]
-    [Tooltip("密度只影响惯性，不影响“能不能保持体积”。")]
     [SerializeField] private float density = 1f;
 
     [Header("Pinning")]
@@ -47,16 +55,9 @@ public sealed class SoftBodySolver : MonoBehaviour
     [SerializeField] private float particleRadius = 0.02f;
 
     [Header("Ground (Plane)")]
-    [Tooltip("打开后：粒子会被投影到地面平面之上（线程安全、便宜）")]
     [SerializeField] private bool collideWithGround = true;
-
-    [Tooltip("如果设置了 Transform，则使用它的位置与 up 作为地面平面；否则使用下方 groundHeight/groundNormal")]
     [SerializeField] private Transform groundTransform;
-
-    [Tooltip("当 groundTransform 为空时生效：地面高度（世界坐标）")]
     [SerializeField] private float groundHeight = 0f;
-
-    [Tooltip("当 groundTransform 为空时生效：地面法线（世界坐标，自动归一化）")]
     [SerializeField] private Vector3 groundNormal = Vector3.up;
 
     [Header("Rendering")]
@@ -81,10 +82,14 @@ public sealed class SoftBodySolver : MonoBehaviour
 
     private int[] surfaceTris;
 
-    // adjacency for gather
+    // adjacency
     private int[] edgesAdjOffsets, edgesAdjOther, edgesAdjEdge;
     private int[] tetsAdjOffsets, tetsAdjTet;
-    private byte[] tetsAdjRole;
+    private int[] tetsAdjRoleI;
+
+    // tri adjacency for normals
+    private int[] triAdjOffsets;
+    private int[] triAdjTri;
 
     // scratch
     private Vector3[] scratchDelta;
@@ -108,8 +113,115 @@ public sealed class SoftBodySolver : MonoBehaviour
     private Vector3 cachedGroundNormalW;
 
     private bool useParallel;
+    private bool useGpu;
+    private SoftBodyManager.ComputeMode cachedMode;
     private int cachedSolverIterations;
+
     private readonly ParallelOptions opt = new ParallelOptions();
+
+    // =======================
+    // Public inter-collision accessors (Manager uses these)
+    // =======================
+    public bool InterSoftBodyCollisionEnabled => interSoftBodyCollision;
+    public int ParticleCount => n;
+    public float ParticleRadius => Mathf.Max(1e-6f, particleRadius);
+    public float[] InvMassArray => invMass;
+    public Vector3[] PosPredArrayCpu => posPredL;
+    public Matrix4x4 CachedLocalToWorld => cachedLocalToWorld;
+    public Matrix4x4 CachedWorldToLocal => cachedWorldToLocal;
+
+    public void DownloadGpuPosPredToCpuIfNeeded()
+    {
+        if (!useGpu) return;
+        if (gpu == null || gpu.posPred == null) return;
+        gpu.posPred.GetData(posPredL);
+    }
+
+    public void UploadCpuPosPredToGpuIfNeeded()
+    {
+        if (!useGpu) return;
+        if (gpu == null || gpu.posPred == null) return;
+        gpu.posPred.SetData(posPredL);
+    }
+
+    // =======================
+    // GPU backend
+    // =======================
+    [StructLayout(LayoutKind.Sequential)]
+    private struct GpuCollider
+    {
+        public int type;
+        public Vector3 positionW;
+        public float pad0;
+        public Vector4 rotationW;
+        public Vector3 data;
+        public float pad1;
+    }
+
+    private sealed class GpuBackend
+    {
+        public ComputeShader cs;
+
+        public int kPre, kEdgeGather, kVolGather, kApply, kCollide, kPost, kNormals;
+
+        public ComputeBuffer pos;
+        public ComputeBuffer posPrev;
+        public ComputeBuffer posPred;
+        public ComputeBuffer vel;
+        public ComputeBuffer invMass;
+
+        public ComputeBuffer edgeAdjOffsets, edgeAdjOther, edgeAdjEdge, restEdgeLen;
+        public ComputeBuffer tetAdjOffsets, tetAdjTet, tetAdjRole, tetIds, restTetVol;
+
+        public ComputeBuffer scratchDelta;
+        public ComputeBuffer scratchCount;
+
+        public ComputeBuffer colliders;
+        public int collidersCapacity;
+
+        // normals
+        public ComputeBuffer surfaceTris;
+        public ComputeBuffer triAdjOffsets;
+        public ComputeBuffer triAdjTri;
+        public ComputeBuffer normals;
+
+        public void Release()
+        {
+            pos?.Release(); pos = null;
+            posPrev?.Release(); posPrev = null;
+            posPred?.Release(); posPred = null;
+            vel?.Release(); vel = null;
+            invMass?.Release(); invMass = null;
+
+            edgeAdjOffsets?.Release(); edgeAdjOffsets = null;
+            edgeAdjOther?.Release(); edgeAdjOther = null;
+            edgeAdjEdge?.Release(); edgeAdjEdge = null;
+            restEdgeLen?.Release(); restEdgeLen = null;
+
+            tetAdjOffsets?.Release(); tetAdjOffsets = null;
+            tetAdjTet?.Release(); tetAdjTet = null;
+            tetAdjRole?.Release(); tetAdjRole = null;
+            tetIds?.Release(); tetIds = null;
+            restTetVol?.Release(); restTetVol = null;
+
+            scratchDelta?.Release(); scratchDelta = null;
+            scratchCount?.Release(); scratchCount = null;
+
+            colliders?.Release(); colliders = null;
+            collidersCapacity = 0;
+
+            surfaceTris?.Release(); surfaceTris = null;
+            triAdjOffsets?.Release(); triAdjOffsets = null;
+            triAdjTri?.Release(); triAdjTri = null;
+            normals?.Release(); normals = null;
+        }
+    }
+
+    private GpuBackend gpu;
+    private MaterialPropertyBlock mpb;
+    private MeshRenderer cachedRenderer;
+
+    private static int DivUp(int a, int b) => (a + b - 1) / b;
 
     private void OnEnable()
     {
@@ -120,8 +232,11 @@ public sealed class SoftBodySolver : MonoBehaviour
 
     private void OnDisable()
     {
-        if (!autoRegisterToManager) return;
-        if (SoftBodyManager.Instance != null) SoftBodyManager.Instance.Unregister(this);
+        if (autoRegisterToManager && SoftBodyManager.Instance != null)
+            SoftBodyManager.Instance.Unregister(this);
+
+        gpu?.Release();
+        gpu = null;
     }
 
     private void TryRegister()
@@ -138,12 +253,14 @@ public sealed class SoftBodySolver : MonoBehaviour
     // ---------- Main-thread cache ----------
     public void CacheStepDataMainThread(
         Vector3 gravityW,
-        bool managerWantsParallel,
+        SoftBodyManager.ComputeMode mode,
         int threads,
         SoftBodyPrimitiveCollider.PrimitiveColliderData[] colliderSnapshot,
         int colliderCount,
         int solverIterations)
     {
+        cachedMode = mode;
+
         cachedLocalToWorld = transform.localToWorldMatrix;
         cachedWorldToLocal = transform.worldToLocalMatrix;
         cachedGravityL = cachedWorldToLocal.MultiplyVector(gravityW);
@@ -153,10 +270,26 @@ public sealed class SoftBodySolver : MonoBehaviour
 
         cachedSolverIterations = Mathf.Max(1, solverIterations);
 
+        // CPU threading decision
+        bool managerWantsParallel = (mode == SoftBodyManager.ComputeMode.MultiThreadWithinSolver);
         useParallel = ResolveUseParallel(managerWantsParallel);
         opt.MaxDegreeOfParallelism = threads > 0 ? threads : Environment.ProcessorCount;
 
-        // ---- ground plane cache (world) ----
+        // GPU decision
+        bool managerWantsGpu = (mode == SoftBodyManager.ComputeMode.GpuCompute);
+        bool wantGpu = allowGpu && managerWantsGpu && softBodyCompute != null;
+        if (wantGpu != useGpu)
+        {
+            if (useGpu && !wantGpu) SyncGpuToCpuBlocking();
+            if (!useGpu && wantGpu)
+            {
+                EnsureGpuCreated();
+                UploadCpuToGpu();
+            }
+        }
+        useGpu = wantGpu;
+
+        // ground cache (world)
         cachedGroundEnabled = collideWithGround;
         if (cachedGroundEnabled)
         {
@@ -190,22 +323,22 @@ public sealed class SoftBodySolver : MonoBehaviour
     // =======================
     public void PreSolveWorkerSafe(float dt)
     {
-        // ST/MT 同一套 kernel，只差调度
-        if (!useParallel) PreSolveSerial(dt);
-        else Parallel.For(0, n, opt, i => PreSolveOne(i, dt));
+        if (useGpu) { GpuPreSolve(dt); return; }
+
+        if (!useParallel) { PreSolveSerial(dt); return; }
+        Parallel.For(0, n, opt, i => PreSolveOne(i, dt));
     }
 
     public void SolveWorkerSafe(float dt)
     {
-        int iters = cachedSolverIterations;
+        if (useGpu) { GpuSolve(dt); return; }
 
+        int iters = cachedSolverIterations;
         for (int iter = 0; iter < iters; iter++)
         {
-            // ST/MT: 동일 알고리즘 (gather -> apply)
             SolveEdgesGatherApply();
             SolveVolumesGatherApply();
 
-            // collisions (thread-safe math only)
             if ((cachedGroundEnabled) || (primitiveCollision && cachedColliderCount > 0))
                 SolveAllCollisions();
         }
@@ -213,9 +346,10 @@ public sealed class SoftBodySolver : MonoBehaviour
 
     public void PostSolveWorkerSafe(float dt)
     {
-        if (!useParallel) PostSolveSerial(dt);
-        else Parallel.For(0, n, opt, i => PostSolveOne(i, dt));
+        if (useGpu) { GpuPostSolve(dt); return; }
 
+        if (!useParallel) { PostSolveSerial(dt); return; }
+        Parallel.For(0, n, opt, i => PostSolveOne(i, dt));
         Array.Copy(posL, renderVerts, n);
     }
 
@@ -223,6 +357,14 @@ public sealed class SoftBodySolver : MonoBehaviour
     public void UploadMeshVerticesBoundsMainThread()
     {
         if (mesh == null) return;
+
+        // GPU rendering path: NO CPU upload
+        if (useGpu && enableGpuRendering)
+        {
+            EnsureGpuRenderBinding();
+            return;
+        }
+
         mesh.vertices = renderVerts;
         mesh.RecalculateBounds();
     }
@@ -231,11 +373,25 @@ public sealed class SoftBodySolver : MonoBehaviour
     {
         if (!updateNormals) return;
         if (mesh == null) return;
+
+        if (useGpu && enableGpuRendering)
+        {
+            EnsureGpuCreated();
+            SetGpuCommonConstants(0f);
+            BindGpuBuffersForKernels();
+
+            int groups = DivUp(n, 256);
+            gpu.cs.Dispatch(gpu.kNormals, groups, 1, 1);
+
+            EnsureGpuRenderBinding();
+            return;
+        }
+
         mesh.RecalculateNormals();
     }
 
     // =======================
-    // Core steps
+    // CPU core steps
     // =======================
     private void PreSolveSerial(float dt)
     {
@@ -260,13 +416,13 @@ public sealed class SoftBodySolver : MonoBehaviour
     private void PostSolveSerial(float dt)
     {
         for (int i = 0; i < n; i++) PostSolveOne(i, dt);
+        Array.Copy(posL, renderVerts, n);
     }
 
     private void PostSolveOne(int i, float dt)
     {
         if (invMass[i] == 0f)
         {
-            // pinned stays
             posL[i] = posPrevL[i];
             posPredL[i] = posPrevL[i];
             velL[i] = Vector3.zero;
@@ -278,9 +434,6 @@ public sealed class SoftBodySolver : MonoBehaviour
         posL[i] = posPredL[i];
     }
 
-    // =======================
-    // Route A: particle-centric gather -> average -> apply
-    // =======================
     private void SolveEdgesGatherApply()
     {
         if (edgeIds == null || restEdgeLen == null || restEdgeLen.Length == 0) return;
@@ -328,7 +481,6 @@ public sealed class SoftBodySolver : MonoBehaviour
             float C = len - restEdgeLen[e];
             Vector3 nrm = d / len;
 
-            // Jacobi gather: delta_i = -(wi/(wi+wj)) * C * n
             float lambda = -edgeStiffness * (C / w);
             sum += nrm * (lambda * wi);
             cnt++;
@@ -349,7 +501,6 @@ public sealed class SoftBodySolver : MonoBehaviour
         }
         else
         {
-            // ✅ 修复：只 gather 一次（你原来贴的代码这里 gather 了两次）
             Parallel.For(0, n, opt, i => GatherVolumesForParticle(i));
             Parallel.For(0, n, opt, i => ApplyDelta(i));
         }
@@ -368,7 +519,7 @@ public sealed class SoftBodySolver : MonoBehaviour
         for (int kk = begin; kk < end; kk++)
         {
             int t = tetsAdjTet[kk];
-            int role = tetsAdjRole[kk];
+            int role = tetsAdjRoleI[kk];
 
             int baseId = 4 * t;
             int a = tetIds[baseId + 0];
@@ -387,7 +538,6 @@ public sealed class SoftBodySolver : MonoBehaviour
             Vector3 pc = posPredL[c];
             Vector3 pd = posPredL[d];
 
-            // gradients of signed volume wrt each vertex
             Vector3 ga = Vector3.Cross(pd - pb, pc - pb) / 6f;
             Vector3 gb = Vector3.Cross(pc - pa, pd - pa) / 6f;
             Vector3 gc = Vector3.Cross(pd - pa, pb - pa) / 6f;
@@ -432,13 +582,9 @@ public sealed class SoftBodySolver : MonoBehaviour
         if (cnt <= 0) return;
         if (invMass[i] == 0f) return;
 
-        // average + SOR
         posPredL[i] += (sorOmega / cnt) * scratchDelta[i];
     }
 
-    // =======================
-    // Collisions (Ground + Primitive)
-    // =======================
     private void SolveAllCollisions()
     {
         if (!useParallel)
@@ -458,17 +604,12 @@ public sealed class SoftBodySolver : MonoBehaviour
         Vector3 pw = cachedLocalToWorld.MultiplyPoint3x4(posPredL[i]);
         float r = Mathf.Max(1e-6f, particleRadius);
 
-        // 1) Ground plane (push out to the positive half-space)
         if (cachedGroundEnabled)
         {
             float dist = Vector3.Dot(cachedGroundNormalW, pw - cachedGroundPointW);
-            if (dist < r)
-            {
-                pw += cachedGroundNormalW * (r - dist);
-            }
+            if (dist < r) pw += cachedGroundNormalW * (r - dist);
         }
 
-        // 2) Primitive colliders
         if (primitiveCollision && cachedColliderCount > 0)
         {
             for (int c = 0; c < cachedColliderCount; c++)
@@ -479,6 +620,290 @@ public sealed class SoftBodySolver : MonoBehaviour
         }
 
         posPredL[i] = cachedWorldToLocal.MultiplyPoint3x4(pw);
+    }
+
+    // =======================
+    // GPU path
+    // =======================
+    private void EnsureGpuCreated()
+    {
+        if (gpu != null) return;
+        if (softBodyCompute == null) throw new InvalidOperationException("ComputeShader missing");
+
+        gpu = new GpuBackend();
+        gpu.cs = softBodyCompute;
+
+        gpu.kPre = gpu.cs.FindKernel("K_PreSolve");
+        gpu.kEdgeGather = gpu.cs.FindKernel("K_EdgeGather");
+        gpu.kVolGather = gpu.cs.FindKernel("K_VolumeGather");
+        gpu.kApply = gpu.cs.FindKernel("K_ApplyDelta");
+        gpu.kCollide = gpu.cs.FindKernel("K_Collide");
+        gpu.kPost = gpu.cs.FindKernel("K_PostSolve");
+        gpu.kNormals = gpu.cs.FindKernel("K_UpdateNormals");
+
+        gpu.pos = new ComputeBuffer(n, sizeof(float) * 3);
+        gpu.posPrev = new ComputeBuffer(n, sizeof(float) * 3);
+        gpu.posPred = new ComputeBuffer(n, sizeof(float) * 3);
+        gpu.vel = new ComputeBuffer(n, sizeof(float) * 3);
+        gpu.invMass = new ComputeBuffer(n, sizeof(float));
+
+        gpu.edgeAdjOffsets = new ComputeBuffer(edgesAdjOffsets.Length, sizeof(int));
+        gpu.edgeAdjOther = new ComputeBuffer(edgesAdjOther.Length, sizeof(int));
+        gpu.edgeAdjEdge = new ComputeBuffer(edgesAdjEdge.Length, sizeof(int));
+        gpu.restEdgeLen = new ComputeBuffer(restEdgeLen.Length, sizeof(float));
+        gpu.edgeAdjOffsets.SetData(edgesAdjOffsets);
+        gpu.edgeAdjOther.SetData(edgesAdjOther);
+        gpu.edgeAdjEdge.SetData(edgesAdjEdge);
+        gpu.restEdgeLen.SetData(restEdgeLen);
+
+        gpu.tetAdjOffsets = new ComputeBuffer(tetsAdjOffsets.Length, sizeof(int));
+        gpu.tetAdjTet = new ComputeBuffer(tetsAdjTet.Length, sizeof(int));
+        gpu.tetAdjRole = new ComputeBuffer(tetsAdjRoleI.Length, sizeof(int));
+        gpu.tetIds = new ComputeBuffer(tetIds.Length, sizeof(int));
+        gpu.restTetVol = new ComputeBuffer(restTetVol.Length, sizeof(float));
+        gpu.tetAdjOffsets.SetData(tetsAdjOffsets);
+        gpu.tetAdjTet.SetData(tetsAdjTet);
+        gpu.tetAdjRole.SetData(tetsAdjRoleI);
+        gpu.tetIds.SetData(tetIds);
+        gpu.restTetVol.SetData(restTetVol);
+
+        gpu.scratchDelta = new ComputeBuffer(n, sizeof(float) * 3);
+        gpu.scratchCount = new ComputeBuffer(n, sizeof(int));
+
+        gpu.collidersCapacity = 64;
+        gpu.colliders = new ComputeBuffer(gpu.collidersCapacity, Marshal.SizeOf(typeof(GpuCollider)));
+
+        // normals resources
+        gpu.surfaceTris = new ComputeBuffer(surfaceTris.Length, sizeof(int));
+        gpu.surfaceTris.SetData(surfaceTris);
+
+        gpu.triAdjOffsets = new ComputeBuffer(triAdjOffsets.Length, sizeof(int));
+        gpu.triAdjOffsets.SetData(triAdjOffsets);
+
+        gpu.triAdjTri = new ComputeBuffer(triAdjTri.Length, sizeof(int));
+        gpu.triAdjTri.SetData(triAdjTri);
+
+        gpu.normals = new ComputeBuffer(n, sizeof(float) * 3);
+
+        EnsureGpuRenderBinding();
+    }
+
+    private void UploadCpuToGpu()
+    {
+        EnsureGpuCreated();
+        gpu.pos.SetData(posL);
+        gpu.posPrev.SetData(posPrevL);
+        gpu.posPred.SetData(posPredL);
+        gpu.vel.SetData(velL);
+        gpu.invMass.SetData(invMass);
+    }
+
+    private void SyncGpuToCpuBlocking()
+    {
+        if (gpu == null) return;
+        gpu.pos.GetData(posL);
+        gpu.posPrev.GetData(posPrevL);
+        gpu.posPred.GetData(posPredL);
+        gpu.vel.GetData(velL);
+        Array.Copy(posL, renderVerts, n);
+    }
+
+    private void EnsureGpuCollidersUploaded()
+    {
+        if (gpu == null) return;
+
+        int count = (primitiveCollision ? cachedColliderCount : 0);
+        if (count <= 0)
+        {
+            gpu.cs.SetInt("_ColliderCount", 0);
+            return;
+        }
+
+        if (count > gpu.collidersCapacity)
+        {
+            gpu.colliders.Release();
+            gpu.collidersCapacity = Mathf.NextPowerOfTwo(count);
+            gpu.colliders = new ComputeBuffer(gpu.collidersCapacity, Marshal.SizeOf(typeof(GpuCollider)));
+            EnsureGpuRenderBinding();
+        }
+
+        var tmp = new GpuCollider[count];
+        for (int i = 0; i < count; i++)
+        {
+            var c = cachedColliders[i];
+            tmp[i].type = (int)c.type;
+            tmp[i].positionW = c.positionW;
+            tmp[i].pad0 = 0f;
+            tmp[i].rotationW = new Vector4(c.rotationW.x, c.rotationW.y, c.rotationW.z, c.rotationW.w);
+            tmp[i].data = c.data;
+            tmp[i].pad1 = 0f;
+        }
+
+        gpu.colliders.SetData(tmp, 0, 0, count);
+        gpu.cs.SetInt("_ColliderCount", count);
+    }
+
+    private void SetGpuCommonConstants(float dt)
+    {
+        var cs = gpu.cs;
+
+        cs.SetInt("_N", n);
+        cs.SetFloat("_Dt", dt);
+
+        cs.SetFloat("_EdgeStiffness", edgeStiffness);
+        cs.SetFloat("_VolumeStiffness", volumeStiffness);
+        cs.SetFloat("_SorOmega", sorOmega);
+
+        cs.SetVector("_GravityL", cachedGravityL);
+
+        cs.SetFloat("_ParticleRadius", Mathf.Max(1e-6f, particleRadius));
+        cs.SetInt("_PrimitiveCollisionEnabled", (primitiveCollision ? 1 : 0));
+
+        cs.SetInt("_GroundEnabled", cachedGroundEnabled ? 1 : 0);
+        cs.SetVector("_GroundPointW", cachedGroundPointW);
+        cs.SetVector("_GroundNormalW", cachedGroundNormalW);
+
+        cs.SetMatrix("_LocalToWorld", cachedLocalToWorld);
+        cs.SetMatrix("_WorldToLocal", cachedWorldToLocal);
+    }
+
+    private void BindGpuBuffersForKernels()
+    {
+        var cs = gpu.cs;
+
+        cs.SetBuffer(gpu.kPre, "_Pos", gpu.pos);
+        cs.SetBuffer(gpu.kPre, "_PosPrev", gpu.posPrev);
+        cs.SetBuffer(gpu.kPre, "_PosPred", gpu.posPred);
+        cs.SetBuffer(gpu.kPre, "_Vel", gpu.vel);
+        cs.SetBuffer(gpu.kPre, "_InvMass", gpu.invMass);
+
+        cs.SetBuffer(gpu.kEdgeGather, "_PosPred", gpu.posPred);
+        cs.SetBuffer(gpu.kEdgeGather, "_InvMass", gpu.invMass);
+        cs.SetBuffer(gpu.kEdgeGather, "_EdgeAdjOffsets", gpu.edgeAdjOffsets);
+        cs.SetBuffer(gpu.kEdgeGather, "_EdgeAdjOther", gpu.edgeAdjOther);
+        cs.SetBuffer(gpu.kEdgeGather, "_EdgeAdjEdge", gpu.edgeAdjEdge);
+        cs.SetBuffer(gpu.kEdgeGather, "_RestEdgeLen", gpu.restEdgeLen);
+        cs.SetBuffer(gpu.kEdgeGather, "_ScratchDelta", gpu.scratchDelta);
+        cs.SetBuffer(gpu.kEdgeGather, "_ScratchCount", gpu.scratchCount);
+
+        cs.SetBuffer(gpu.kVolGather, "_PosPred", gpu.posPred);
+        cs.SetBuffer(gpu.kVolGather, "_InvMass", gpu.invMass);
+        cs.SetBuffer(gpu.kVolGather, "_TetAdjOffsets", gpu.tetAdjOffsets);
+        cs.SetBuffer(gpu.kVolGather, "_TetAdjTet", gpu.tetAdjTet);
+        cs.SetBuffer(gpu.kVolGather, "_TetAdjRole", gpu.tetAdjRole);
+        cs.SetBuffer(gpu.kVolGather, "_TetIds", gpu.tetIds);
+        cs.SetBuffer(gpu.kVolGather, "_RestTetVol", gpu.restTetVol);
+        cs.SetBuffer(gpu.kVolGather, "_ScratchDelta", gpu.scratchDelta);
+        cs.SetBuffer(gpu.kVolGather, "_ScratchCount", gpu.scratchCount);
+
+        cs.SetBuffer(gpu.kApply, "_PosPred", gpu.posPred);
+        cs.SetBuffer(gpu.kApply, "_InvMass", gpu.invMass);
+        cs.SetBuffer(gpu.kApply, "_ScratchDelta", gpu.scratchDelta);
+        cs.SetBuffer(gpu.kApply, "_ScratchCount", gpu.scratchCount);
+
+        cs.SetBuffer(gpu.kCollide, "_PosPred", gpu.posPred);
+        cs.SetBuffer(gpu.kCollide, "_InvMass", gpu.invMass);
+        cs.SetBuffer(gpu.kCollide, "_Colliders", gpu.colliders);
+
+        cs.SetBuffer(gpu.kPost, "_Pos", gpu.pos);
+        cs.SetBuffer(gpu.kPost, "_PosPrev", gpu.posPrev);
+        cs.SetBuffer(gpu.kPost, "_PosPred", gpu.posPred);
+        cs.SetBuffer(gpu.kPost, "_Vel", gpu.vel);
+        cs.SetBuffer(gpu.kPost, "_InvMass", gpu.invMass);
+
+        // normals
+        cs.SetBuffer(gpu.kNormals, "_Pos", gpu.pos);
+        cs.SetBuffer(gpu.kNormals, "_SurfaceTris", gpu.surfaceTris);
+        cs.SetBuffer(gpu.kNormals, "_TriAdjOffsets", gpu.triAdjOffsets);
+        cs.SetBuffer(gpu.kNormals, "_TriAdjTri", gpu.triAdjTri);
+        cs.SetBuffer(gpu.kNormals, "_Normals", gpu.normals);
+    }
+
+    private void GpuPreSolve(float dt)
+    {
+        EnsureGpuCreated();
+        SetGpuCommonConstants(dt);
+        BindGpuBuffersForKernels();
+
+        int groups = DivUp(n, 256);
+        gpu.cs.Dispatch(gpu.kPre, groups, 1, 1);
+    }
+
+    private void GpuSolve(float dt)
+    {
+        EnsureGpuCreated();
+        SetGpuCommonConstants(dt);
+        BindGpuBuffersForKernels();
+        EnsureGpuCollidersUploaded();
+
+        int groups = DivUp(n, 256);
+        int iters = cachedSolverIterations;
+
+        for (int iter = 0; iter < iters; iter++)
+        {
+            gpu.cs.Dispatch(gpu.kEdgeGather, groups, 1, 1);
+            gpu.cs.Dispatch(gpu.kApply, groups, 1, 1);
+
+            gpu.cs.Dispatch(gpu.kVolGather, groups, 1, 1);
+            gpu.cs.Dispatch(gpu.kApply, groups, 1, 1);
+
+            if (cachedGroundEnabled || (primitiveCollision && cachedColliderCount > 0))
+                gpu.cs.Dispatch(gpu.kCollide, groups, 1, 1);
+        }
+    }
+
+    private void GpuPostSolve(float dt)
+    {
+        EnsureGpuCreated();
+        SetGpuCommonConstants(dt);
+        BindGpuBuffersForKernels();
+
+        int groups = DivUp(n, 256);
+        gpu.cs.Dispatch(gpu.kPost, groups, 1, 1);
+
+        if (!enableGpuRendering)
+        {
+            SyncGpuToCpuBlocking();
+        }
+    }
+
+    private void EnsureGpuRenderBinding()
+    {
+        if (!enableGpuRendering) return;
+        if (gpu == null || gpu.pos == null || gpu.normals == null) return;
+
+        if (cachedRenderer == null) cachedRenderer = GetComponent<MeshRenderer>();
+        if (cachedRenderer == null) return;
+
+        if (gpuRenderMaterialOverride != null)
+            cachedRenderer.sharedMaterial = gpuRenderMaterialOverride;
+
+        if (mpb == null) mpb = new MaterialPropertyBlock();
+        cachedRenderer.GetPropertyBlock(mpb);
+
+        mpb.SetBuffer("_Positions", gpu.pos);
+        mpb.SetBuffer("_Normals", gpu.normals);
+
+        // light params
+        var sun = RenderSettings.sun;
+        Vector3 lightDir = Vector3.down;
+        Vector3 lightColor = Vector3.one;
+
+        if (sun != null && sun.type == LightType.Directional)
+        {
+            lightDir = -sun.transform.forward;
+            Color c = sun.color * sun.intensity;
+            lightColor = new Vector3(c.r, c.g, c.b);
+        }
+
+        mpb.SetVector("_LightDirWS", lightDir.normalized);
+        mpb.SetVector("_LightColor", lightColor);
+
+        cachedRenderer.SetPropertyBlock(mpb);
+
+        // avoid frustum culling due to static bounds
+        if (mesh != null)
+            mesh.bounds = new Bounds(Vector3.zero, Vector3.one * 10000f);
     }
 
     // =======================
@@ -525,8 +950,6 @@ public sealed class SoftBodySolver : MonoBehaviour
         int tetCount = tetIds.Length / 4;
         restTetVol = new float[tetCount];
 
-        // ---- Correct mass build: accumulate mass, then invert ----
-        // ✅ 质量必须用 |volume|（否则有负体积四面体会得到“接近 0 的质量”，invMass 爆炸导致坍缩/炸裂）
         float[] mass = new float[n];
         float dens = Mathf.Max(1e-6f, density);
 
@@ -549,14 +972,12 @@ public sealed class SoftBodySolver : MonoBehaviour
             mass[c] += share;
             mass[d] += share;
 
-            // 体积约束仍然用 signed volume（保持定向体积）
             restTetVol[t] = signedVol;
         }
 
         for (int i = 0; i < n; i++)
             invMass[i] = mass[i] > 0f ? 1f / mass[i] : 0f;
 
-        // pin top
         if (pinTopLayer)
         {
             float topY = float.NegativeInfinity;
@@ -578,7 +999,8 @@ public sealed class SoftBodySolver : MonoBehaviour
         surfaceTris = (int[])meshAsset.surfaceTriIds.Clone();
 
         BuildEdgeAdjacency(n, edgeIds, out edgesAdjOffsets, out edgesAdjOther, out edgesAdjEdge);
-        BuildTetAdjacency(n, tetIds, out tetsAdjOffsets, out tetsAdjTet, out tetsAdjRole);
+        BuildTetAdjacency(n, tetIds, out tetsAdjOffsets, out tetsAdjTet, out tetsAdjRoleI);
+        BuildTriAdjacency(n, surfaceTris, out triAdjOffsets, out triAdjTri);
 
         scratchDelta = new Vector3[n];
         scratchCount = new int[n];
@@ -668,7 +1090,7 @@ public sealed class SoftBodySolver : MonoBehaviour
         int[] tetIds,
         out int[] offsets,
         out int[] tetIndex,
-        out byte[] role)
+        out int[] roleI)
     {
         int tetCount = tetIds != null ? (tetIds.Length / 4) : 0;
         offsets = new int[numParticles + 1];
@@ -676,7 +1098,7 @@ public sealed class SoftBodySolver : MonoBehaviour
         if (tetCount == 0)
         {
             tetIndex = Array.Empty<int>();
-            role = Array.Empty<byte>();
+            roleI = Array.Empty<int>();
             return;
         }
 
@@ -694,7 +1116,7 @@ public sealed class SoftBodySolver : MonoBehaviour
 
         int total = offsets[numParticles];
         tetIndex = new int[total];
-        role = new byte[total];
+        roleI = new int[total];
 
         int[] cur = new int[numParticles];
         Array.Copy(offsets, cur, numParticles);
@@ -707,10 +1129,55 @@ public sealed class SoftBodySolver : MonoBehaviour
             int c = tetIds[k + 2];
             int d = tetIds[k + 3];
 
-            int ka = cur[a]++; tetIndex[ka] = t; role[ka] = 0;
-            int kb = cur[b]++; tetIndex[kb] = t; role[kb] = 1;
-            int kc = cur[c]++; tetIndex[kc] = t; role[kc] = 2;
-            int kd = cur[d]++; tetIndex[kd] = t; role[kd] = 3;
+            int ka = cur[a]++; tetIndex[ka] = t; roleI[ka] = 0;
+            int kb = cur[b]++; tetIndex[kb] = t; roleI[kb] = 1;
+            int kc = cur[c]++; tetIndex[kc] = t; roleI[kc] = 2;
+            int kd = cur[d]++; tetIndex[kd] = t; roleI[kd] = 3;
+        }
+    }
+
+    private static void BuildTriAdjacency(
+        int numParticles,
+        int[] surfaceTris,
+        out int[] offsets,
+        out int[] triIndex)
+    {
+        int triCount = surfaceTris != null ? (surfaceTris.Length / 3) : 0;
+        offsets = new int[numParticles + 1];
+
+        if (triCount == 0)
+        {
+            triIndex = Array.Empty<int>();
+            return;
+        }
+
+        for (int t = 0; t < triCount; t++)
+        {
+            int k = 3 * t;
+            offsets[surfaceTris[k + 0] + 1]++;
+            offsets[surfaceTris[k + 1] + 1]++;
+            offsets[surfaceTris[k + 2] + 1]++;
+        }
+
+        for (int i = 0; i < numParticles; i++)
+            offsets[i + 1] += offsets[i];
+
+        int total = offsets[numParticles];
+        triIndex = new int[total];
+
+        int[] cur = new int[numParticles];
+        Array.Copy(offsets, cur, numParticles);
+
+        for (int t = 0; t < triCount; t++)
+        {
+            int k = 3 * t;
+            int a = surfaceTris[k + 0];
+            int b = surfaceTris[k + 1];
+            int c = surfaceTris[k + 2];
+
+            triIndex[cur[a]++] = t;
+            triIndex[cur[b]++] = t;
+            triIndex[cur[c]++] = t;
         }
     }
 }
