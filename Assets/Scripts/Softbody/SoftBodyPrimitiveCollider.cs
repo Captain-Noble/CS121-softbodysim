@@ -1,5 +1,4 @@
 // SoftBodyPrimitiveCollider.cs
-// 请以 UTF-8 保存本文件
 using UnityEngine;
 
 [DisallowMultipleComponent]
@@ -15,31 +14,17 @@ public sealed class SoftBodyPrimitiveCollider : MonoBehaviour
     public struct PrimitiveColliderData
     {
         public PrimitiveType type;
-
-        // World-space center of the primitive
         public Vector3 positionW;
-
-        // Box: OBB rotation
-        // Capsule: rotation such that local Y is the capsule axis in world
         public Quaternion rotationW;
-
-        // Sphere: x = radius
-        // Box: x,y,z = halfExtents
-        // Capsule: x = radius, y = halfHeight (cylinder part), axis = local Y
         public Vector3 data;
     }
 
-    [Header("Auto from Unity Collider (recommended)")]
+    [Header("Auto from Unity Collider")]
     [SerializeField] private bool autoFromUnityCollider = true;
-
-    [Tooltip("可选：指定一个 Unity Collider；为空则自动 GetComponent<Collider>()")]
     [SerializeField] private Collider sourceCollider;
-
-    [Tooltip("默认忽略 Trigger；如果你想让 Trigger 也参与推开，勾选此项")]
     [SerializeField] private bool includeTriggers = false;
 
-    // ---- Manual fallback (only used when autoFromUnityCollider=false or no supported collider found) ----
-    [Header("Manual Fallback (optional)")]
+    [Header("Manual Fallback")]
     [SerializeField] private PrimitiveType manualType = PrimitiveType.Sphere;
 
     [Header("Sphere")]
@@ -67,20 +52,21 @@ public sealed class SoftBodyPrimitiveCollider : MonoBehaviour
         get
         {
             if (!isActiveAndEnabled) return false;
-            var c = UnityCol;
+
             if (autoFromUnityCollider)
             {
+                var c = UnityCol;
                 if (c == null) return false;
                 if (!c.enabled) return false;
                 if (!includeTriggers && c.isTrigger) return false;
             }
+
             return true;
         }
     }
 
     private void OnEnable()
     {
-        // 双保险：Instance 没有也去找一个
         var mgr = SoftBodyManager.Instance != null ? SoftBodyManager.Instance : FindObjectOfType<SoftBodyManager>(true);
         if (mgr != null) mgr.RegisterPrimitiveCollider(this);
     }
@@ -97,12 +83,10 @@ public sealed class SoftBodyPrimitiveCollider : MonoBehaviour
         {
             var c = UnityCol;
 
-            // 如果没 collider / 不支持，fallback 到 manual
             if (c is SphereCollider sc) return FromSphereCollider(sc);
             if (c is BoxCollider bc) return FromBoxCollider(bc);
             if (c is CapsuleCollider cc) return FromCapsuleCollider(cc);
 
-            // 不支持 MeshCollider / TerrainCollider 等，自动 fallback
             return FromManualFallback();
         }
 
@@ -113,8 +97,6 @@ public sealed class SoftBodyPrimitiveCollider : MonoBehaviour
     {
         PrimitiveColliderData d;
         d.type = PrimitiveType.Sphere;
-
-        // Unity 的 center 是 local-space，需要 TransformPoint
         d.positionW = transform.TransformPoint(sc.center);
         d.rotationW = transform.rotation;
 
@@ -127,7 +109,6 @@ public sealed class SoftBodyPrimitiveCollider : MonoBehaviour
     {
         PrimitiveColliderData d;
         d.type = PrimitiveType.Box;
-
         d.positionW = transform.TransformPoint(bc.center);
         d.rotationW = transform.rotation;
 
@@ -148,14 +129,11 @@ public sealed class SoftBodyPrimitiveCollider : MonoBehaviour
 
         d.positionW = transform.TransformPoint(cc.center);
 
-        // CapsuleCollider.direction: 0=X,1=Y,2=Z
         Vector3 axisLocal =
             (cc.direction == 0) ? Vector3.right :
             (cc.direction == 2) ? Vector3.forward :
             Vector3.up;
 
-        // 让“我们的 capsule 数学”仍然假设轴是 local Y：
-        // 通过额外旋转把 local Y 对齐到 Unity capsule 的轴
         Quaternion axisRotLocal = Quaternion.FromToRotation(Vector3.up, axisLocal);
         d.rotationW = transform.rotation * axisRotLocal;
 
@@ -167,11 +145,8 @@ public sealed class SoftBodyPrimitiveCollider : MonoBehaviour
         else if (cc.direction == 2) { sPerp1 = s.x; sPerp2 = s.y; }
         else { sPerp1 = s.x; sPerp2 = s.z; }
 
-        // 半径用“垂直方向中最大的缩放”做保守处理（非均匀缩放下 capsule 本就不严格）
         float sRad = Mathf.Max(sPerp1, sPerp2);
         float radiusW = Mathf.Max(1e-6f, cc.radius * sRad);
-
-        // Unity CapsuleCollider.height 包含两个半球，圆柱部分半高 = height/2 - radius
         float halfHeightW = Mathf.Max(0f, (cc.height * sAxis) * 0.5f - radiusW);
 
         d.data = new Vector3(radiusW, halfHeightW, 0f);
@@ -201,7 +176,7 @@ public sealed class SoftBodyPrimitiveCollider : MonoBehaviour
                     break;
                 }
 
-            default: // Capsule (local Y)
+            default:
                 {
                     float s = MaxAbsScale(transform.lossyScale);
                     d.data = new Vector3(
