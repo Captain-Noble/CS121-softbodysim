@@ -1,15 +1,9 @@
-// SoftBodyPrimitiveCollider.cs
 using UnityEngine;
 
 [DisallowMultipleComponent]
 public sealed class SoftBodyPrimitiveCollider : MonoBehaviour
 {
-    public enum PrimitiveType
-    {
-        Sphere = 0,
-        Box = 1,
-        Capsule = 2
-    }
+    public enum PrimitiveType { Sphere = 0, Box = 1, Capsule = 2 }
 
     public struct PrimitiveColliderData
     {
@@ -52,15 +46,13 @@ public sealed class SoftBodyPrimitiveCollider : MonoBehaviour
         get
         {
             if (!isActiveAndEnabled) return false;
-
+            var c = UnityCol;
             if (autoFromUnityCollider)
             {
-                var c = UnityCol;
                 if (c == null) return false;
                 if (!c.enabled) return false;
                 if (!includeTriggers && c.isTrigger) return false;
             }
-
             return true;
         }
     }
@@ -147,6 +139,7 @@ public sealed class SoftBodyPrimitiveCollider : MonoBehaviour
 
         float sRad = Mathf.Max(sPerp1, sPerp2);
         float radiusW = Mathf.Max(1e-6f, cc.radius * sRad);
+
         float halfHeightW = Mathf.Max(0f, (cc.height * sAxis) * 0.5f - radiusW);
 
         d.data = new Vector3(radiusW, halfHeightW, 0f);

@@ -1,8 +1,9 @@
-Shader "SoftBody/GPULit"
+Shader "SoftBody/GPULitTextured"
 {
     Properties
     {
-        _BaseColor ("Base Color", Color) = (0.9,0.9,0.95,1)
+        _MainTex ("Albedo", 2D) = "white" {}
+        _BaseColor ("Base Color", Color) = (1,1,1,1)
         _SpecColor ("Spec Color", Color) = (1,1,1,1)
         _Gloss ("Gloss (0..1)", Range(0,1)) = 0.35
         _AmbientColor ("Ambient", Color) = (0.2,0.2,0.2,1)
@@ -22,6 +23,9 @@ Shader "SoftBody/GPULit"
             StructuredBuffer<float3> _Positions;
             StructuredBuffer<float3> _Normals;
 
+            sampler2D _MainTex;
+            float4 _MainTex_ST;
+
             float4 _BaseColor;
             float4 _SpecColor;
             float _Gloss;
@@ -40,6 +44,7 @@ Shader "SoftBody/GPULit"
             struct Attributes
             {
                 uint vertexID : SV_VertexID;
+                float2 uv : TEXCOORD0;
             };
 
             struct Varyings
@@ -47,6 +52,7 @@ Shader "SoftBody/GPULit"
                 float4 positionCS : SV_POSITION;
                 float3 posWS : TEXCOORD0;
                 float3 nrmWS : TEXCOORD1;
+                float2 uv : TEXCOORD2;
             };
 
             Varyings vert(Attributes v)
@@ -60,9 +66,10 @@ Shader "SoftBody/GPULit"
                 float4 pW4 = mul(unity_ObjectToWorld, float4(pL, 1));
                 o.posWS = pW4.xyz;
 
-                // normal matrix = transpose(worldToObject)
                 float3 nW = mul((float3x3)unity_WorldToObject, nL);
                 o.nrmWS = normalize(nW);
+
+                o.uv = v.uv * _MainTex_ST.xy + _MainTex_ST.zw;
 
                 o.positionCS = mul(unity_MatrixVP, pW4);
                 return o;
@@ -70,6 +77,9 @@ Shader "SoftBody/GPULit"
 
             float4 frag(Varyings i) : SV_Target
             {
+                float3 texCol = tex2D(_MainTex, i.uv).rgb;
+                float3 baseCol = texCol * _BaseColor.rgb;
+
                 float3 N = normalize(i.nrmWS);
                 float3 L = normalize(_LightDirWS);
                 float3 V = normalize(_WorldSpaceCameraPos - i.posWS);
@@ -79,7 +89,6 @@ Shader "SoftBody/GPULit"
                 float shininess = lerp(8.0, 128.0, saturate(_Gloss));
                 float spec = pow(saturate(dot(N, H)), shininess);
 
-                float3 baseCol = _BaseColor.rgb;
                 float3 ambient = _AmbientColor.rgb * baseCol;
                 float3 diffuse = ndl * _LightColor * baseCol;
                 float3 specular = spec * _LightColor * _SpecColor.rgb;

@@ -1,22 +1,16 @@
-﻿// SoftBodyManager.cs
-using System;
+﻿using System;
 using System.Collections.Generic;
 using System.Diagnostics;
 using UnityEngine;
 
 public sealed class SoftBodyManager : MonoBehaviour
 {
-    public enum ComputeMode
-    {
-        SingleThread = 0,
-        MultiThreadWithinSolver = 1,
-        GpuCompute = 2
-    }
+    public enum ComputeMode { SingleThread = 0, MultiThreadWithinSolver = 1, GpuCompute = 2 }
 
     private struct FrameTimers
     {
-        public double TotalMs, CacheMs, PreMs, SolveMs, CollidersMs, PostMs, UploadMs, NormalsMs;
-        public void Clear() => TotalMs = CacheMs = PreMs = SolveMs = CollidersMs = PostMs = UploadMs = NormalsMs = 0.0;
+        public double TotalMs, CacheMs, PreMs, SolveMs, PostMs, UploadMs, NormalsMs;
+        public void Clear() => TotalMs = CacheMs = PreMs = SolveMs = PostMs = UploadMs = NormalsMs = 0.0;
     }
 
     public static SoftBodyManager Instance { get; private set; }
@@ -26,10 +20,9 @@ public sealed class SoftBodyManager : MonoBehaviour
     [SerializeField, Min(1)] private int substeps = 8;
     [SerializeField, Min(1)] private int solverIterations = 6;
 
+    [Header("Update Fixed-Timestep")]
     [SerializeField] private bool simulateInFixedUpdate = false;
     [SerializeField] private float fixedDtOverride = 1f / 60f;
-
-    [Header("Update Fixed-Timestep")]
     [SerializeField, Min(1)] private int maxStepsPerFrame = 4;
     [SerializeField, Min(0.001f)] private float maxFrameDeltaTime = 0.05f;
 
@@ -178,12 +171,11 @@ public sealed class SoftBodyManager : MonoBehaviour
         double pcCache = 100.0 * period.CacheMs / denom;
         double pcPre = 100.0 * period.PreMs / denom;
         double pcSolve = 100.0 * period.SolveMs / denom;
-        double pcCol = 100.0 * period.CollidersMs / denom;
         double pcPost = 100.0 * period.PostMs / denom;
         double pcUp = 100.0 * period.UploadMs / denom;
         double pcN = 100.0 * period.NormalsMs / denom;
 
-        int threadCount = maxWorkerThreads > 0 ? maxWorkerThreads : System.Environment.ProcessorCount;
+        int threadCount = maxWorkerThreads > 0 ? maxWorkerThreads : Environment.ProcessorCount;
         string modeStr = computeMode == ComputeMode.SingleThread ? "ST"
                       : computeMode == ComputeMode.MultiThreadWithinSolver ? "MT"
                       : "GPU";
@@ -194,7 +186,6 @@ public sealed class SoftBodyManager : MonoBehaviour
             $"Cache {period.CacheMs:F3}({pcCache:F1}%) " +
             $"Pre {period.PreMs:F3}({pcPre:F1}%) " +
             $"Solve {period.SolveMs:F3}({pcSolve:F1}%) " +
-            $"Coll {period.CollidersMs:F3}({pcCol:F1}%) " +
             $"Post {period.PostMs:F3}({pcPost:F1}%) " +
             $"Upload {period.UploadMs:F3}({pcUp:F1}%) " +
             $"Norm {period.NormalsMs:F3}({pcN:F1}%)"
@@ -209,7 +200,7 @@ public sealed class SoftBodyManager : MonoBehaviour
     {
         if (solvers.Count == 0) return;
 
-        int threads = maxWorkerThreads > 0 ? maxWorkerThreads : System.Environment.ProcessorCount;
+        int threads = maxWorkerThreads > 0 ? maxWorkerThreads : Environment.ProcessorCount;
 
         swTotal.Restart();
 
