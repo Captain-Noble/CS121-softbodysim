@@ -1,0 +1,491 @@
+// SoftBodyCompute.compute
+#pragma kernel K_PreSolve
+#pragma kernel K_EdgeGather
+#pragma kernel K_VolumeGather
+#pragma kernel K_ApplyDelta
+#pragma kernel K_Collide
+#pragma kernel K_PostSolve
+#pragma kernel K_UpdateNormals
+
+#pragma target 4.5
+
+StructuredBuffer<float> _InvMass;
+
+RWStructuredBuffer<float3> _Pos;
+RWStructuredBuffer<float3> _PosPrev;
+RWStructuredBuffer<float3> _PosPred;
+RWStructuredBuffer<float3> _Vel;
+
+// Edge adjacency
+StructuredBuffer<int> _EdgeAdjOffsets;
+StructuredBuffer<int> _EdgeAdjOther;
+StructuredBuffer<int> _EdgeAdjEdge;
+StructuredBuffer<float> _RestEdgeLen;
+
+// Tet adjacency
+StructuredBuffer<int> _TetAdjOffsets;
+StructuredBuffer<int> _TetAdjTet;
+StructuredBuffer<int> _TetAdjRole;
+StructuredBuffer<int> _TetIds;
+StructuredBuffer<float> _RestTetVol;
+
+// Scratch
+RWStructuredBuffer<float3> _ScratchDelta;
+RWStructuredBuffer<int> _ScratchCount;
+
+// Colliders
+struct GpuCollider
+{
+    int type;
+    float3 positionW;
+    float pad0;
+    float4 rotationW;
+    float3 data;
+    float pad1;
+};
+StructuredBuffer<GpuCollider> _Colliders;
+
+// Normals
+StructuredBuffer<int> _SurfaceTris;
+StructuredBuffer<int> _TriAdjOffsets;
+StructuredBuffer<int> _TriAdjTri;
+RWStructuredBuffer<float3> _Normals;
+
+// Constants
+int _N;
+float _Dt;
+
+float _EdgeStiffness;
+float _VolumeStiffness;
+float _SorOmega;
+
+float3 _GravityL;
+
+float _ParticleRadius;
+int _PrimitiveCollisionEnabled;
+
+int _GroundEnabled;
+float3 _GroundPointW;
+float3 _GroundNormalW;
+
+int _ColliderCount;
+
+float4x4 _LocalToWorld;
+float4x4 _WorldToLocal;
+
+static const float EPS = 1e-12;
+
+float3 QuatRotate(float4 q, float3 v)
+{
+    float3 t = 2.0 * cross(q.xyz, v);
+    return v + q.w * t + cross(q.xyz, t);
+}
+
+float4 QuatConjugate(float4 q)
+{
+    return float4(-q.x, -q.y, -q.z, q.w);
+}
+
+float TetSignedVolume(float3 p0, float3 p1, float3 p2, float3 p3)
+{
+    float3 a = p1 - p0;
+    float3 b = p2 - p0;
+    float3 c = p3 - p0;
+    return dot(cross(a, b), c) / 6.0;
+}
+
+float3 ClosestPointOnSegment(float3 a, float3 b, float3 p)
+{
+    float3 ab = b - a;
+    float ab2 = dot(ab, ab);
+    if (ab2 < EPS)
+        return a;
+    float t = dot(p - a, ab) / ab2;
+    t = clamp(t, 0.0, 1.0);
+    return a + t * ab;
+}
+
+bool PushOutSphere(in GpuCollider c, float3 p, float r, out float3 push)
+{
+    float R = c.data.x + r;
+    float3 d = p - c.positionW;
+    float dist2 = dot(d, d);
+    if (dist2 >= R * R)
+    {
+        push = 0;
+        return false;
+    }
+    float dist = sqrt(max(dist2, 1e-18));
+    float3 n = (dist > 1e-9) ? (d / dist) : float3(0, 1, 0);
+    push = n * (R - dist);
+    return true;
+}
+
+bool PushOutCapsule(in GpuCollider c, float3 p, float r, out float3 push)
+{
+    float radius = c.data.x;
+    float halfH = c.data.y;
+
+    float4 q = c.rotationW;
+    float3 axis = QuatRotate(q, float3(0, 1, 0));
+
+    float3 a = c.positionW - axis * halfH;
+    float3 b = c.positionW + axis * halfH;
+
+    float3 cp = ClosestPointOnSegment(a, b, p);
+
+    float R = radius + r;
+    float3 d = p - cp;
+    float dist2 = dot(d, d);
+    if (dist2 >= R * R)
+    {
+        push = 0;
+        return false;
+    }
+
+    float dist = sqrt(max(dist2, 1e-18));
+    float3 n = (dist > 1e-9) ? (d / dist) : float3(0, 1, 0);
+    push = n * (R - dist);
+    return true;
+}
+
+bool PushOutBox(in GpuCollider c, float3 p, float r, out float3 push)
+{
+    float3 he = c.data.xyz;
+    float4 q = c.rotationW;
+
+    float3 rel = p - c.positionW;
+    float3 pl = QuatRotate(QuatConjugate(q), rel);
+
+    float3 cl = clamp(pl, -he, he);
+    float3 d = pl - cl;
+    float dist2 = dot(d, d);
+
+    if (dist2 > 1e-18)
+    {
+        float dist = sqrt(dist2);
+        if (dist >= r)
+        {
+            push = 0;
+            return false;
+        }
+        float3 n = d / dist;
+        float3 pushL = n * (r - dist);
+        push = QuatRotate(q, pushL);
+        return true;
+    }
+    else
+    {
+        float3 ap = abs(pl);
+        float dx = he.x - ap.x;
+        float dy = he.y - ap.y;
+        float dz = he.z - ap.z;
+
+        float3 pushL = 0;
+        if (dx <= dy && dx <= dz)
+        {
+            float s = (pl.x >= 0) ? 1.0 : -1.0;
+            pushL = float3(s * (dx + r), 0, 0);
+        }
+        else if (dy <= dz)
+        {
+            float s = (pl.y >= 0) ? 1.0 : -1.0;
+            pushL = float3(0, s * (dy + r), 0);
+        }
+        else
+        {
+            float s = (pl.z >= 0) ? 1.0 : -1.0;
+            pushL = float3(0, 0, s * (dz + r));
+        }
+
+        push = QuatRotate(q, pushL);
+        return true;
+    }
+}
+
+[numthreads(256, 1, 1)]
+void K_PreSolve(uint id : SV_DispatchThreadID)
+{
+    if (id >= (uint) _N)
+        return;
+
+    float w = _InvMass[id];
+    float3 x = _Pos[id];
+
+    _PosPrev[id] = x;
+
+    if (w == 0.0)
+    {
+        _Vel[id] = 0;
+        _PosPred[id] = x;
+        return;
+    }
+
+    float3 v = _Vel[id] + _GravityL * _Dt;
+    _Vel[id] = v;
+    _PosPred[id] = x + v * _Dt;
+}
+
+[numthreads(256, 1, 1)]
+void K_EdgeGather(uint i : SV_DispatchThreadID)
+{
+    if (i >= (uint) _N)
+        return;
+
+    float wi = _InvMass[i];
+    if (wi == 0.0)
+    {
+        _ScratchDelta[i] = 0;
+        _ScratchCount[i] = 0;
+        return;
+    }
+
+    int begin = _EdgeAdjOffsets[i];
+    int end = _EdgeAdjOffsets[i + 1];
+
+    float3 xi = _PosPred[i];
+
+    float3 sum = 0;
+    int cnt = 0;
+
+    for (int k = begin; k < end; k++)
+    {
+        int j = _EdgeAdjOther[k];
+        float wj = _InvMass[j];
+        float w = wi + wj;
+        if (w == 0.0)
+            continue;
+
+        int e = _EdgeAdjEdge[k];
+        float3 xj = _PosPred[j];
+
+        float3 d = xi - xj;
+        float len2 = dot(d, d);
+        if (len2 < 1e-18)
+            continue;
+
+        float len = sqrt(len2);
+        float C = len - _RestEdgeLen[e];
+        float3 nrm = d / len;
+
+        float lambda = -_EdgeStiffness * (C / w);
+        sum += nrm * (lambda * wi);
+        cnt++;
+    }
+
+    _ScratchDelta[i] = sum;
+    _ScratchCount[i] = cnt;
+}
+
+[numthreads(256, 1, 1)]
+void K_VolumeGather(uint idx : SV_DispatchThreadID)
+{
+    if (idx >= (uint) _N)
+        return;
+
+    float wi0 = _InvMass[idx];
+    if (wi0 == 0.0)
+    {
+        _ScratchDelta[idx] = 0;
+        _ScratchCount[idx] = 0;
+        return;
+    }
+
+    int begin = _TetAdjOffsets[idx];
+    int end = _TetAdjOffsets[idx + 1];
+
+    float3 sum = 0;
+    int cnt = 0;
+
+    for (int kk = begin; kk < end; kk++)
+    {
+        int t = _TetAdjTet[kk];
+        int role = _TetAdjRole[kk];
+
+        int baseId = 4 * t;
+        int a = _TetIds[baseId + 0];
+        int b = _TetIds[baseId + 1];
+        int c = _TetIds[baseId + 2];
+        int d = _TetIds[baseId + 3];
+
+        float wa = _InvMass[a];
+        float wb = _InvMass[b];
+        float wc = _InvMass[c];
+        float wd = _InvMass[d];
+        if (wa + wb + wc + wd == 0.0)
+            continue;
+
+        float3 pa = _PosPred[a];
+        float3 pb = _PosPred[b];
+        float3 pc = _PosPred[c];
+        float3 pd = _PosPred[d];
+
+        float3 ga = cross(pd - pb, pc - pb) / 6.0;
+        float3 gb = cross(pc - pa, pd - pa) / 6.0;
+        float3 gc = cross(pd - pa, pb - pa) / 6.0;
+        float3 gd = cross(pb - pa, pc - pa) / 6.0;
+
+        float wsum =
+            wa * dot(ga, ga) +
+            wb * dot(gb, gb) +
+            wc * dot(gc, gc) +
+            wd * dot(gd, gd);
+
+        if (wsum < 1e-20)
+            continue;
+
+        float vol = TetSignedVolume(pa, pb, pc, pd);
+        float C = vol - _RestTetVol[t];
+
+        float lambda = -_VolumeStiffness * (C / wsum);
+
+        float3 g;
+        float wi;
+        if (role == 0)
+        {
+            g = ga;
+            wi = wa;
+        }
+        else if (role == 1)
+        {
+            g = gb;
+            wi = wb;
+        }
+        else if (role == 2)
+        {
+            g = gc;
+            wi = wc;
+        }
+        else
+        {
+            g = gd;
+            wi = wd;
+        }
+
+        if (wi == 0.0)
+            continue;
+
+        sum += g * (lambda * wi);
+        cnt++;
+    }
+
+    _ScratchDelta[idx] = sum;
+    _ScratchCount[idx] = cnt;
+}
+
+[numthreads(256, 1, 1)]
+void K_ApplyDelta(uint i : SV_DispatchThreadID)
+{
+    if (i >= (uint) _N)
+        return;
+
+    int cnt = _ScratchCount[i];
+    if (cnt <= 0)
+        return;
+    if (_InvMass[i] == 0.0)
+        return;
+
+    _PosPred[i] += (_SorOmega / (float) cnt) * _ScratchDelta[i];
+}
+
+[numthreads(256, 1, 1)]
+void K_Collide(uint i : SV_DispatchThreadID)
+{
+    if (i >= (uint) _N)
+        return;
+    if (_InvMass[i] == 0.0)
+        return;
+
+    float3 pl = _PosPred[i];
+    float3 pw = mul(_LocalToWorld, float4(pl, 1.0)).xyz;
+    float r = _ParticleRadius;
+
+    if (_GroundEnabled != 0)
+    {
+        float dist = dot(_GroundNormalW, pw - _GroundPointW);
+        if (dist < r)
+            pw += _GroundNormalW * (r - dist);
+    }
+
+    if (_PrimitiveCollisionEnabled != 0 && _ColliderCount > 0)
+    {
+        [loop]
+        for (int c = 0; c < _ColliderCount; c++)
+        {
+            float3 push = 0;
+            bool hit = false;
+
+            GpuCollider col = _Colliders[c];
+            if (col.type == 0)
+                hit = PushOutSphere(col, pw, r, push);
+            else if (col.type == 1)
+                hit = PushOutBox(col, pw, r, push);
+            else
+                hit = PushOutCapsule(col, pw, r, push);
+
+            if (hit)
+                pw += push;
+        }
+    }
+
+    float3 pl2 = mul(_WorldToLocal, float4(pw, 1.0)).xyz;
+    _PosPred[i] = pl2;
+}
+
+[numthreads(256, 1, 1)]
+void K_PostSolve(uint i : SV_DispatchThreadID)
+{
+    if (i >= (uint) _N)
+        return;
+
+    float w = _InvMass[i];
+    float3 prev = _PosPrev[i];
+
+    if (w == 0.0)
+    {
+        _Pos[i] = prev;
+        _PosPred[i] = prev;
+        _Vel[i] = 0;
+        return;
+    }
+
+    float3 pred = _PosPred[i];
+    float invDt = (_Dt > 0.0) ? (1.0 / _Dt) : 0.0;
+
+    _Vel[i] = (pred - prev) * invDt;
+    _Pos[i] = pred;
+}
+
+[numthreads(256, 1, 1)]
+void K_UpdateNormals(uint i : SV_DispatchThreadID)
+{
+    if (i >= (uint) _N)
+        return;
+
+    int begin = _TriAdjOffsets[i];
+    int end = _TriAdjOffsets[i + 1];
+
+    float3 sumN = 0;
+
+    for (int k = begin; k < end; k++)
+    {
+        int t = _TriAdjTri[k];
+        int baseId = 3 * t;
+
+        int a = _SurfaceTris[baseId + 0];
+        int b = _SurfaceTris[baseId + 1];
+        int c = _SurfaceTris[baseId + 2];
+
+        float3 pa = _Pos[a];
+        float3 pb = _Pos[b];
+        float3 pc = _Pos[c];
+
+        sumN += cross(pb - pa, pc - pa);
+    }
+
+    float n2 = dot(sumN, sumN);
+    if (n2 < 1e-20)
+        _Normals[i] = float3(0, 1, 0);
+    else
+        _Normals[i] = sumN * rsqrt(n2);
+}

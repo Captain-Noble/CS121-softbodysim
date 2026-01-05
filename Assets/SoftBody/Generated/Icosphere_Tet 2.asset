@@ -9,7 +9,7 @@ MonoBehaviour:
   m_GameObject: {fileID: 0}
   m_Enabled: 1
   m_EditorHideFlags: 0
-  m_Script: {fileID: 11500000, guid: 6b572d33991928547936f6296ac67582, type: 3}
+  m_Script: {fileID: 11500000, guid: 418de6b5e21841a4e83d818b478b988f, type: 3}
   m_Name: Icosphere_Tet 2
   m_EditorClassIdentifier: 
   vertices:
